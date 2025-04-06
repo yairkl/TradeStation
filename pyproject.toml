@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradestation"
+version = "0.1.0"
+description = "A Python wrapper for the TradeStation API"
+authors = [{ name="Yair Klein", email="yair@yedidia.net" }]
+readme = "README.md"
+license = { file="LICENSE" }
+dependencies = [
+    "httpx",
+    "aiohttp"
+]

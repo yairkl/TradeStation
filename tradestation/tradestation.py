@@ -1,18 +1,48 @@
 import os
-import requests
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlparse, parse_qs
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
 from typing import Literal, Optional, Union, List, Generator, AsyncGenerator
 import json
 import httpx
 import asyncio
 from aiohttp import web
 
-load_dotenv(override=True)
+AUTH_URL = "https://signin.tradestation.com/authorize"
+TOKEN_URL = "https://signin.tradestation.com/oauth/token"
+LIVE_API_URL = "https://api.tradestation.com/v3"
+DEMO_API_URL = "https://sim-api.tradestation.com/v3"
+auth_success_html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authentication Successful</title>
+    <script>
+        setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+            font-size: 24px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    Authentication successful!
+</body>
+</html>
+"""
 
 class OAuthHandler(BaseHTTPRequestHandler):
     """Handles OAuth authentication callback from TradeStation."""
@@ -261,8 +291,15 @@ class Order:
 class TradeStation:
     """Handles authentication and API requests for TradeStation."""
     ### Initiation and Authentication handling ###
-    def __init__(self, refresh_token_margin:float=60):
-        self._load_env_variables()
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None, port: int = 8080,
+                 is_demo: bool = True, refresh_token_margin:float=60):
+        self.client_id = client_id if client_id else os.getenv('CLIENT_ID')
+        self.client_secret = client_secret if client_secret else os.getenv('CLIENT_SECRET')
+        assert self.client_id, "Either client_id or CLIENT_ID environment variable must be provided."
+        assert self.client_secret, "Either client_secret or CLIENT_SECRET environment variable must be provided."
+        self.port=port
+        self.api_url = DEMO_API_URL if is_demo else LIVE_API_URL
+        self.redirect_uri = f'http://localhost:{self.port}/'
         self.access_token = None
         self.refresh_token = None
         self.expires_in = None
@@ -271,19 +308,6 @@ class TradeStation:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._authenticate())
         # self.refresh_task = loop.create_task(self._refresh_token_loop())
-
-    def _load_env_variables(self):
-        """Loads required environment variables."""
-        self.client_id = os.getenv('CLIENT_ID')
-        self.client_secret = os.getenv('CLIENT_SECRET')
-        self.auth_url = os.getenv('AUTH_URL')
-        self.token_url = os.getenv('TOKEN_URL')
-        self.port = int(os.getenv('PORT', 8080))
-        self.api_url = os.getenv('API_URL')
-        self.redirect_uri = f'http://localhost:{self.port}/'
-        
-        if not all([self.client_id, self.client_secret, self.auth_url, self.token_url]):
-            raise ValueError("Missing required environment variables")
 
     def _generate_auth_url(self) -> str:
         """Generates the authentication URL for TradeStation OAuth."""
@@ -295,7 +319,7 @@ class TradeStation:
             'scope': 'openid profile offline_access MarketData ReadAccount Trade',
             'state': 'xyzv'  # Use a secure state to prevent CSRF attacks
         }
-        return f"{self.auth_url}?{urlencode(params)}"
+        return f"https://signin.tradestation.com/authorize?{urlencode(params)}"
     
     def _start_server(self):
         """Starts a local HTTP server to handle OAuth callback."""
@@ -318,8 +342,7 @@ class TradeStation:
         if code:
             await self._exchange_code_for_token(code)
             self.auth_code_event.set()
-            with open("auth_success.html", 'rb') as f:
-                return web.Response(body=f.read(), content_type='text/html')
+            return web.Response(body=auth_success_html, content_type='text/html')
         return web.Response(text="No authorization code found.")
     
     async def _exchange_code_for_token(self, code:str):
@@ -333,8 +356,7 @@ class TradeStation:
         }
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         async with httpx.AsyncClient() as client:
-            response = await client.post(self.token_url, data=data, headers=headers)
-        
+            response = await client.post(TOKEN_URL, data=data, headers=headers)
             if response.status_code == 200:
                 body = response.json()
                 self.access_token = body['access_token']
@@ -378,7 +400,7 @@ class TradeStation:
             'refresh_token': self.refresh_token
         }
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        response = await self._asend_request(url=self.token_url, data=data, headers=headers)
+        response = await self._asend_request(url=TOKEN_URL, data=data, headers=headers)
         if response.status_code == 200:
             body = response.json()
             self.access_token = body['access_token']
@@ -386,7 +408,7 @@ class TradeStation:
         else:
             raise ValueError(f"Error refreshing token: {response.text}")
 
-    def _handle_token_response(self, response: requests.Response) -> None:
+    def _handle_token_response(self, response: httpx.Response) -> None:
         """
         Handles the response from token exchange or refresh request.
 
@@ -430,7 +452,8 @@ class TradeStation:
         url = f"{self.api_url}/{endpoint}"
         if not headers:
             headers = {"Authorization": f"Bearer {self.access_token}"}
-        response = requests.request(method, url, headers=headers, params=params, json=payload)
+        with httpx.Client() as client:
+            response = client.request(method, url, headers=headers, params=params, json=payload)
         if response.status_code == 200:
             return response.json()
         else:
@@ -493,17 +516,17 @@ class TradeStation:
         if not headers and self.access_token:
             headers = {"Authorization": f"Bearer {self.access_token}"}
 
-        with requests.request(method, url, headers=headers, params=params, json=payload, stream=True, timeout=timeout) as response:
+        with httpx.stream(method, url, headers=headers, params=params, json=payload, timeout=timeout) as response:
             if response.status_code == 200:
                 for line in response.iter_lines():
                     if line:
                         try:
-                            data = json.loads(line.decode("utf-8"))
+                            data = json.loads(line)
                             yield data
                         except json.JSONDecodeError:
                             raise ValueError(f"Invalid JSON received: {line}")
             else:
-                raise ValueError(f"Request failed with status code {response.status_code} and message: \"{response.text}\"")
+                raise ValueError(f"Request failed with status code {response.status_code} and message: \"{response.read().decode()}\"")
     
     async def _astream_request(self, 
                                endpoint: str, 
@@ -511,7 +534,7 @@ class TradeStation:
                                method: Literal['GET', 'POST', 'PUT', 'DELETE'] = 'GET', 
                                headers: Optional[dict] = None, 
                                payload: Optional[dict] = None, 
-                               timeout: Union[int, float] = 10) -> AsyncGenerator[dict, None, None]:
+                               timeout: Union[int, float] = 10) -> AsyncGenerator[dict, None]:
         """
         Streams an asynchronous HTTP request to the TradeStation API.
 

@@ -14,9 +14,9 @@ This library provides an interface to interact with the TradeStation API, includ
 Clone the repository and install the dependencies:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/yairkl/TradeStation.git
 cd tradestation
-pip install -r requirements.txt
+pip install 
 ```
 
 ## Usage
@@ -73,14 +73,10 @@ asyncio.run(main())
 
 ## Environment Variables
 
-Set the following environment variables in a `.env` file:
+Set the following environment variables for authentication:
 
 - `CLIENT_ID`
 - `CLIENT_SECRET`
-- `AUTH_URL`
-- `TOKEN_URL`
-- `API_URL`
-- `PORT` (optional, default: 8080)
 
 ## License
 
