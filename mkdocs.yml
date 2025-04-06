@@ -1,0 +1,9 @@
+site_name: TradeStation python API
+site_description: TradeStation API documentation
+site_author: Yair Klein
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Overview: getting_started.md
+      - Installation: installation.md
+  - Usage: usage.md

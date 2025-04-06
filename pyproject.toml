@@ -13,3 +13,7 @@ dependencies = [
     "httpx",
     "aiohttp"
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+docs = ["mkdocs", "mkdocs-material"]
