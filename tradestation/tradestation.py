@@ -1,8 +1,6 @@
 import os
-import threading
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, Union, List, Generator, AsyncGenerator
 import json
@@ -43,138 +41,6 @@ auth_success_html = """
 </body>
 </html>
 """
-
-class OAuthHandler(BaseHTTPRequestHandler):
-    """Handles OAuth authentication callback from TradeStation."""
-    access_token = None
-    
-    def do_GET(self):
-        parsed_url = urlparse(self.path)
-        query_params = parse_qs(parsed_url.query)
-
-        if 'code' not in query_params:
-            self.send_error(400, "Error: No code received")
-            return
-
-        self.send_response(200)
-        self.end_headers()
-        with open("auth_success.html", 'rb') as f:
-            self.wfile.write(f.read())
-
-        # Exchange code for token
-        code = query_params['code'][0]
-        self.server.auth_instance.exchange_code_for_token(code)
-
-        # Stop the server
-        threading.Thread(target=self.server.shutdown).start()
-
-class AsyncOAuthHandler:
-    """Handles OAuth authentication callback asynchronously."""
-    def __init__(self, port = 8080, client_id=None, client_secret=None, token_url=None, auth_url=None, refresh_token_margin=60):
-        self.port = port
-        self.client_id = client_id if client_id else os.getenv('CLIENT_ID')
-        self.client_secret = client_secret if client_secret else os.getenv('CLIENT_SECRET')
-        self.token_url = token_url if token_url else os.getenv('TOKEN_URL')
-        self.auth_url = auth_url if auth_url else os.getenv('AUTH_URL')
-        self.token = None
-        self.refresh_token = None
-        self.token_expiry = None
-        self.refresh_margin = timedelta(seconds=refresh_token_margin)
-        self.token_refresh_task = None
-        self.auth_code_event = asyncio.Event()
-
-    async def start_auth_server(self):
-        app = web.Application()
-        app.router.add_get("/", self.handle_auth_redirect)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "localhost", self.port)
-        await site.start()
-        print(f"Listening on http://localhost:{self.port} for auth code...")
-
-    def _generate_auth_url(self) -> str:
-        """Generates the authentication URL for TradeStation OAuth."""
-        params = {
-            'response_type': 'code',
-            'client_id': self.client_id,
-            'audience': 'https://api.tradestation.com',
-            'redirect_uri': f"http://localhost:{self.port}",
-            'scope': 'openid profile offline_access MarketData ReadAccount Trade',
-            'state': 'xyzv'  # Use a secure state to prevent CSRF attacks
-        }
-        return f"{self.auth_url}?{urlencode(params)}"
-
-    async def handle_auth_redirect(self, request):
-        query = request.rel_url.query
-        code = query.get("code")
-        if code:
-            await self.exchange_code_for_token(code)
-            self.auth_code_event.set()
-            with open("auth_success.html", 'rb') as f:
-                return web.Response(body=f.read(), content_type='text/html')
-        return web.Response(text="No authorization code found.")
-
-    async def exchange_code_for_token(self, code):
-        """Exchanges the authorization code for an access token."""
-        data = {
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': f'http://localhost:{self.port}/',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret
-        }
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        async with httpx.AsyncClient() as client:
-            response = await client.post(self.token_url, data=data, headers=headers)
-        
-            if response.status_code == 200:
-                body = response.json()
-                self.token = body['access_token']
-                self.refresh_token = body['refresh_token']
-                self.token_expiry = datetime.now() + timedelta(seconds=body.get('expires_in', 1200))
-                print("Access token acquired:", self.token)
-            else:
-                print(f"Error obtaining token: {response.text}")
-
-    async def refresh_token_loop(self):
-        while True:
-            if not self.refresh_token:
-                print("No refresh token available.")
-                return
-
-            now = datetime.now()
-            refresh_in = self.token_expiry - now - self.refresh_margin
-            refresh_in = max(refresh_in.seconds, 0)
-            print(f"Refreshing token in {refresh_in:.1f} seconds")
-            await asyncio.sleep(delay=refresh_in)
-
-            data = {
-                'grant_type': 'refresh_token',
-                'client_id': self.client_id,
-                'client_secret': self.client_secret,
-                'refresh_token': self.refresh_token
-            }
-            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-            print("Refreshing access token...")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(self.token_url, data=data, headers=headers)
-                if response.status_code == 200:
-                    body = response.json()
-                    self.token = body['access_token']
-                    self.refresh_token = body['refresh_token']
-                    self.token_expiry = datetime.now() + timedelta(seconds=body.get('expires_in', 1200))
-                    print("Access token refreshed:", self.token)
-                else:
-                    print(f"Error refreshing token: {response.text}")
-
-    async def run(self):
-        await self.start_auth_server()
-        webbrowser.open(self._generate_auth_url())
-        # Wait for the first auth to complete
-        await self.auth_code_event.wait()
-
-        # Start background refresh
-        self.token_refresh_task = asyncio.create_task(self.refresh_token_loop())
 
 class Order:
     """Represents an order for group order placement."""
@@ -321,13 +187,6 @@ class TradeStation:
         }
         return f"https://signin.tradestation.com/authorize?{urlencode(params)}"
     
-    def _start_server(self):
-        """Starts a local HTTP server to handle OAuth callback."""
-        OAuthHandler.access_token = None
-        server = HTTPServer(("127.0.0.1", self.port), OAuthHandler)
-        server.auth_instance = self
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-
     async def _start_auth_server(self):
         app = web.Application()
         app.router.add_get("/", self._handle_auth_redirect)
