@@ -451,7 +451,7 @@ class TradeStation:
         
         if last_date:
             params['lastdate'] = last_date.replace(microsecond=0).astimezone(timezone.utc).isoformat()
-        return self._send_request(f"marketdata/barcharts/{symbol}", params)
+        return self._send_request(f"marketdata/barcharts/{symbol}", params).get('Bars', [])
 
     async def aget_bars(self, 
                         symbol: str, 
@@ -479,7 +479,8 @@ class TradeStation:
         
         if last_date:
             params['lastdate'] = last_date.replace(microsecond=0).astimezone(timezone.utc).isoformat()
-        return await self._asend_request(f"marketdata/barcharts/{symbol}", params)
+        res = await self._asend_request(f"marketdata/barcharts/{symbol}", params)
+        return res.get('Bars', [])
 
     def stream_tick_bars(self,
                          symbol: str, 
