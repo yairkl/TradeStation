@@ -1,12 +1,14 @@
 import os
 import webbrowser
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, Union, List, Generator, AsyncGenerator
 import json
 import httpx
 import asyncio
 from aiohttp import web
+import threading
 
 AUTH_URL = "https://signin.tradestation.com/authorize"
 TOKEN_URL = "https://signin.tradestation.com/oauth/token"
@@ -41,6 +43,31 @@ auth_success_html = """
 </body>
 </html>
 """
+
+class OAuthHandler(BaseHTTPRequestHandler):
+    """Handles OAuth authentication callback from TradeStation."""
+    access_token = None
+    
+    def do_GET(self):
+        print("Received GET request")
+        parsed_url = urlparse(self.path)
+        query_params = parse_qs(parsed_url.query)
+
+        if 'code' not in query_params:
+            self.send_error(400, "Error: No code received")
+            return
+
+        self.send_response(200)
+        self.end_headers()
+        # with open("auth_success.html", 'rb') as f:
+        #     self.wfile.write(f.read())
+        self.wfile.write(auth_success_html.encode('utf-8'))
+        # Exchange code for token
+        code = query_params['code'][0]
+        self.server.auth_instance._exchange_code_for_token(code)
+
+        # Stop the server
+        threading.Thread(target=self.server.shutdown).start()
 
 class Order:
     """Represents an order for group order placement."""
@@ -158,7 +185,7 @@ class TradeStation:
     """Handles authentication and API requests for TradeStation."""
     ### Initiation and Authentication handling ###
     def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None, port: int = 8080,
-                 is_demo: bool = True, refresh_token_margin:float=60):
+                 is_demo: bool = True, refresh_token_margin:float=60, async_mode: bool = False):
         self.client_id = client_id if client_id else os.getenv('CLIENT_ID')
         self.client_secret = client_secret if client_secret else os.getenv('CLIENT_SECRET')
         assert self.client_id, "Either client_id or CLIENT_ID environment variable must be provided."
@@ -170,9 +197,13 @@ class TradeStation:
         self.refresh_token = None
         self.expires_in = None
         self.refresh_margin = timedelta(seconds=refresh_token_margin)
-        self.auth_code_event = asyncio.Event()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self._authenticate())
+        if async_mode:
+            self.auth_code_event = asyncio.Event()
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self._async_authenticate())
+        else:
+            self._authenticate()
+            
         # self.refresh_task = loop.create_task(self._refresh_token_loop())
 
     def _generate_auth_url(self) -> str:
@@ -187,24 +218,54 @@ class TradeStation:
         }
         return f"https://signin.tradestation.com/authorize?{urlencode(params)}"
     
-    async def _start_auth_server(self):
+    def _start_server(self):
+        """Starts a local HTTP server to handle OAuth callback."""
+        OAuthHandler.access_token = None
+        server = HTTPServer(("127.0.0.1", self.port), OAuthHandler)
+        server.auth_instance = self
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    async def _start_async_server(self):
         app = web.Application()
         app.router.add_get("/", self._handle_auth_redirect)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "localhost", self.port)
-        await site.start()
+        self.server = web.TCPSite(runner, "localhost", self.port)
+        await self.server.start()
+
+    async def _stop_async_server(self):
+        await self.server.stop()
 
     async def _handle_auth_redirect(self, request):
         query = request.rel_url.query
         code = query.get("code")
         if code:
-            await self._exchange_code_for_token(code)
+            await self._async_exchange_code_for_token(code)
             self.auth_code_event.set()
             return web.Response(body=auth_success_html, content_type='text/html')
         return web.Response(text="No authorization code found.")
-    
-    async def _exchange_code_for_token(self, code:str):
+
+    def _exchange_code_for_token(self, code: str):
+        """Exchanges authorization code for an access token."""
+        data = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': self.redirect_uri,
+            'client_id': self.client_id,
+            'client_secret': self.client_secret
+        }
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        with httpx.Client() as client:
+            response = client.post(TOKEN_URL, data=data, headers=headers)
+            if response.status_code == 200:
+                body = response.json()
+                self.access_token = body['access_token']
+                self.refresh_token = body['refresh_token']
+                self.token_expiry = datetime.now() + timedelta(seconds=body.get('expires_in', 1200))
+            else:
+                raise ValueError(f"Error obtaining token: {response.text}")
+
+    async def _async_exchange_code_for_token(self, code:str):
         """Exchanges the authorization code for an access token."""
         data = {
             'grant_type': 'authorization_code',
@@ -267,29 +328,20 @@ class TradeStation:
         else:
             raise ValueError(f"Error refreshing token: {response.text}")
 
-    def _handle_token_response(self, response: httpx.Response) -> None:
-        """
-        Handles the response from token exchange or refresh request.
+    def _authenticate(self):
+        """Handles the authentication flow."""
+        self._start_server()
+        webbrowser.open(self._generate_auth_url())
+        
+        while self.access_token is None:
+            pass
 
-        :param response: The HTTP response object from the token request.
-        :raises ValueError: If the response contains an error or invalid data.
-        """
-        body = response.json()
-        if response.status_code == 200:
-            self.access_token = body['access_token']
-            self.refresh_token = body['refresh_token']
-            self.expires_in = datetime.now() + timedelta(seconds=body.get('expires_in', 1200))
-        else:
-            raise ValueError(f"Error obtaining token: {body}")
-    
-    async def _authenticate(self):
-        await self._start_auth_server()
+    async def _async_authenticate(self):
+        await self._start_async_server()
         webbrowser.open(self._generate_auth_url())
         # Wait for the first auth to complete
         await self.auth_code_event.wait()
-
-        # Start background refresh
-        # self.token_refresh_task = asyncio.create_task(self._refresh_token_loop())
+        await self._stop_async_server()
     
     def _send_request(self, 
                       endpoint: str, 
@@ -487,16 +539,18 @@ class TradeStation:
                          unit: Literal['Minute', 'Daily', 'Weekly', 'Monthly'] = 'Daily', 
                          interval: int = 1,
                          bars_back: int = None,
-                         session_template: Literal['USEQPre', 'USEQPost', 'USEQPreAndPost', 'USEQ24Hour', 'Default'] = 'Default',
-                         data_handler=print,
-                         error_handler=print,
-                         heartbeat_handler=lambda x:None):
+                         session_template: Literal['USEQPre', 'USEQPost', 'USEQPreAndPost', 'USEQ24Hour', 'Default'] = 'Default') -> Generator[dict, None, None]:
         """
         Streams tick bars data for the specified symbol.
 
         :param symbol: The symbol to stream data for.
         :param interval: Interval for each bar one of: 'Minute', 'Daily', 'Weekly', 'Monthly'.
         :param bars_back: Number of bars to retrieve.
+        :param session_template: Session template for the data stream.
+        :return: A generator yielding parsed JSON data from the stream, the data can be one of the following:
+            - "Heartbeat": Heartbeat message indicating the stream is alive.
+            - "Error": Error message indicating an issue with the stream.
+            - Tick bar data: Actual tick bar data for the specified symbol.
         """
 
         # Validate inputs
@@ -513,17 +567,7 @@ class TradeStation:
         if bars_back:
             params['barsback'] = bars_back
         
-        for data in self._stream_request(f"marketdata/stream/barcharts/{symbol}", params=params):
-            if data:
-                if "Heartbeat" in data:
-                    heartbeat_handler(data)
-                elif "Error" in data:
-                    error_handler(data)
-                else:
-                    data_handler(data)
-            else:
-                error_handler({"Error": "InvalidData",
-                               "Message": "Received empty data from the stream."})
+        return self._stream_request(f"marketdata/stream/barcharts/{symbol}", params=params)
     
     async def astream_tick_bars(self,
                                symbol: str, 
@@ -531,9 +575,9 @@ class TradeStation:
                                interval: int = 1,
                                bars_back: int = None,
                                session_template: Literal['USEQPre', 'USEQPost', 'USEQPreAndPost', 'USEQ24Hour', 'Default'] = 'Default',
-                               data_handler=print,
-                               error_handler=print,
-                               heartbeat_handler=print):
+                               data_handler: Optional[callable] = None,
+                               error_handler: Optional[callable] = None,
+                               heartbeat_handler: Optional[callable] = None) -> Union[AsyncGenerator[dict, None], None]:
         """
         Asynchronously streams tick bars data for the specified symbol.
 
@@ -558,17 +602,25 @@ class TradeStation:
         if bars_back:
             params["barsback"] = bars_back
 
-        async for data in self._astream_request(f"marketdata/stream/barcharts/{symbol}", params=params):
+        data_generator = self._astream_request(f"marketdata/stream/barcharts/{symbol}", params=params)
+        if not data_handler:
+            return data_generator
+        async for data in data_generator:
             if data:
                 if "Heartbeat" in data:
-                    heartbeat_handler(data)
+                    if heartbeat_handler:
+                        heartbeat_handler(data)
                 elif "Error" in data:
-                    error_handler(data)
+                    if error_handler:
+                        error_handler(data)
                 else:
                     data_handler(data)
             else:
-                error_handler({"Error": "InvalidData",
-                               "Message": "Received empty data from the stream."})
+                if error_handler:
+                    error_handler({"Error": "InvalidData",
+                                "Message": "Received empty data from the stream."})
+                else:
+                    raise ValueError("Received empty data from the stream.")
 
     ### Brokerage services ###
     
@@ -683,14 +735,13 @@ class TradeStation:
 
     async def astream_positions(self, accounts: Union[str, List[str]], 
                                  changes: bool = False,
-                                 data_handler=print, 
-                                 error_handler=print, 
-                                 heartbeat_handler=lambda x: None,
-                                 status_handler=print,
-                                 deleted_handler=print):
+                                 data_handler: Optional[callable] = None, 
+                                 error_handler: Optional[callable] = None,
+                                 heartbeat_handler: Optional[callable] = None,
+                                 status_handler: Optional[callable] = None,
+                                 deleted_handler: Optional[callable] = None) -> Union[AsyncGenerator[dict, None], None]:
         """
         Streams positions for the given accounts asynchronously. Request valid for Cash, Margin, Futures, and DVP account types.
-
         :param accounts: List of valid Account IDs for the authenticated user in comma-separated format.
         :param changes: Boolean value to specify whether to stream updates as changes.
         :param data_handler: Function to handle incoming position data.
@@ -698,6 +749,12 @@ class TradeStation:
         :param heartbeat_handler: Function to handle heartbeat messages.
         :param status_handler: Function to handle stream status messages.
         :param deleted_handler: Function to handle deleted messages.
+        :return: An asynchronous generator yielding parsed JSON data from the stream, the data can be one of the following:
+            - "Heartbeat": Heartbeat message indicating the stream is alive.
+            - "Error": Error message indicating an issue with the stream.
+            - "StreamStatus": Status message indicating the current state of the stream.
+            - "Deleted": Message indicating that a position has been deleted.
+            - Position data: Actual position data for the specified accounts.
         """
         if isinstance(accounts, str):
             accounts = [accounts]
@@ -705,6 +762,9 @@ class TradeStation:
 
         params = {"changes": str(changes).lower()}
 
+        data_generator = self._astream_request(endpoint=f"brokerage/stream/accounts/{accounts}/positions", params=params)
+        if not data_handler:
+            return data_generator
         async for data in self._astream_request(endpoint=f"brokerage/stream/accounts/{accounts}/positions", params=params):
             if data:
                 if "Heartbeat" in data:
